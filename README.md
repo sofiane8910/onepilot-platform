@@ -84,6 +84,33 @@ The deploy step writes `config.json` next to `__init__.py`. Fields:
 | `agentProfileId` | Onepilot agent profile this plugin belongs to. |
 | `sessionKey` | Default session routing key. |
 
+## Cutting a new version
+
+Six steps. Skipping the sha256 re-fetch (#5) is the known footgun — GitHub re-uploads the asset on publish, so the digest you see while it's a draft does **not** match the published artifact.
+
+1. **Bump** the version in `pyproject.toml` AND `plugin.yaml` (both must agree — Hermes reads `plugin.yaml`, the wrapper-api `/health` endpoint reads `pyproject.toml`).
+2. **Commit + tag** in this repo: `git commit -am "Release vX.Y.Z" && git tag vX.Y.Z && git push --follow-tags`. Update the submodule pointer in `onepilotapp/` and push there too — the release CI in `onepilotapp` builds the tarball from that pointer.
+3. **Watch the release CI** (`gh run watch -R sofiane8910/onepilotapp`) cut a draft GitHub Release with the tarball attached as an asset.
+4. **Publish the draft**: `gh release edit "hermes/onepilot-platform@vX.Y.Z" -R sofiane8910/onepilotapp --draft=false --latest=false`. Until this runs, the asset URL returns HTTP 404 and every iOS install fails fast.
+5. **Re-fetch the canonical sha256** from the published asset (GitHub may have repacked):
+   ```sh
+   curl -sL "https://github.com/sofiane8910/onepilotapp/releases/download/hermes/onepilot-platform%40vX.Y.Z/onepilot-platform-vX.Y.Z.tgz" \
+     | shasum -a 256 | awk '{print $1}'
+   ```
+6. **Bump the manifest** in Supabase (one row, three columns):
+   ```sql
+   UPDATE public.plugin_manifest
+   SET version = 'vX.Y.Z',
+       tarball_url = 'https://github.com/sofiane8910/onepilotapp/releases/download/hermes/onepilot-platform%40vX.Y.Z/onepilot-platform-vX.Y.Z.tgz',
+       sha256 = '<sha from step 5>'
+   WHERE channel = 'hermes-stable';
+   ```
+   Apply via `mcp__supabase_onepilot__execute_sql` (or the Supabase dashboard) — `service_role` is required because RLS denies DML to `anon`/`authenticated`. Existing agents pick up the new release on their next `ensureSyncSetup`; iOS doesn't need rebuilding.
+
+## Rollback
+
+If a release misbehaves, revert the `plugin_manifest` row to a known-good `version` + `tarball_url` + `sha256`. Existing agents stay on their installed version (the install script is a no-op when `plugin.yaml`'s `version:` already matches), but reinstalls and new deploys pick up the rollback.
+
 ## License
 
 MIT
