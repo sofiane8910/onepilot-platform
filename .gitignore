@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .pytest_cache/
 config.json
+
+# Internal contributor notes (best-practices doc, not for public eyes)
+CLAUDE.md

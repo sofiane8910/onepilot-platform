@@ -33,7 +33,8 @@ These rules govern every change to this plugin. The app ships through App Store 
 
 **Practical contract:**
 
-- Bump `pyproject.toml` + `plugin.yaml` versions + refresh the bundled Swift snapshot (`HermesOnepilotPlugin.swift`) in the same PR.
+- **Push == release.** Every `git push origin main` here must be paired with a fresh GitHub release **and** a `plugin_manifest` UPDATE (channel=`hermes-stable`) in Supabase pinning the new version, URL, and sha256. Anything less leaves users on a stale pin while `main` claims a newer state. Follow the full 6-step runbook in [Cutting a new version](#cutting-a-new-version) — no shortcuts. The iOS app trusts the manifest, not `main`.
+- Bump `pyproject.toml` + `plugin.yaml` versions in the same PR (both must agree — Hermes reads `plugin.yaml`, the wrapper-api `/health` endpoint reads `pyproject.toml`).
 - New `/onepilot/v1/*` endpoint → contract test in `test/test_wrapper_api.py` + matching method in `OnepilotPluginClient.swift` in the app repo.
 - Bootstrap commands (the very first `hermes profile create`, first plugin write, first `gateway run`) are exempt — by definition the wrapper API doesn't exist yet.
 
