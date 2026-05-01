@@ -209,6 +209,13 @@ async def _run(config: dict[str, Any]) -> None:
     # file) so a vanilla install doesn't change agent behavior; flipped via
     # ``approvals_cli.py enable`` from the iOS adapter.
     try:
+        # Hermes loads __init__.py as a top-level module without adding the
+        # plugin dir to sys.path, so a plain `from approvals import ...`
+        # fails with ModuleNotFoundError. Insert ourselves first.
+        import sys as _sys
+        _plugin_dir = str(Path(__file__).resolve().parent)
+        if _plugin_dir not in _sys.path:
+            _sys.path.insert(0, _plugin_dir)
         from approvals import approvals_loop  # type: ignore
         asyncio.create_task(approvals_loop(config, _broadcast))
     except Exception as exc:
