@@ -427,23 +427,40 @@ async def _progress_upsert(
     session_id: str,
     user_id: str,
     agent_profile_id: str,
-    reasoning_text: str,
+    *,
+    reasoning_text: Optional[str] = None,
+    partial_response: Optional[str] = None,
+    status_label: Optional[str] = None,
+    is_active: bool = True,
+    set_started_at: bool = False,
 ) -> None:
-    """Persist the in-flight reasoning trail to `agent_session_progress` so
-    the iOS client can hydrate it on bootstrap if the user reopens a chat
-    mid-thought. Realtime broadcasts are fire-and-forget; this single live
-    row fills the disconnect-window gap. Best-effort: a 404 on the table
-    (migration not applied yet) is logged at debug and ignored — the chat
-    still works without it. Framework-agnostic: any agent plugin writes
-    the same shape."""
+    """Persist live agent state to `agent_session_progress` so iOS can rebuild
+    the full in-flight UI (Lottie spinner, status pill, partial response,
+    reasoning trail) on bootstrap / app-foreground / conversation-reopen.
+    Realtime broadcasts are fire-and-forget; this single row is the durable
+    catch-up snapshot. Best-effort — a 404 (migration not applied yet) or
+    transient network error is logged at debug and ignored. Framework-
+    agnostic: any agent plugin writes the same shape."""
     import httpx
+    from datetime import datetime, timezone
     url = f"{config['backendUrl']}/rest/v1/agent_session_progress"
-    body = {
+    now_iso = datetime.now(timezone.utc).isoformat()
+    body: dict[str, Any] = {
         "session_id": str(session_id).lower(),
         "user_id": str(user_id).lower(),
         "agent_profile_id": str(agent_profile_id).lower(),
-        "reasoning_text": reasoning_text,
+        "is_active": is_active,
+        "last_activity_at": now_iso,
+        "updated_at": now_iso,
     }
+    if reasoning_text is not None:
+        body["reasoning_text"] = reasoning_text
+    if partial_response is not None:
+        body["partial_response"] = partial_response
+    if status_label is not None:
+        body["status_label"] = status_label
+    if set_started_at:
+        body["started_at"] = now_iso
     headers = {
         "Content-Type": "application/json",
         "apikey": config["publishableKey"],
@@ -459,24 +476,26 @@ async def _progress_upsert(
         logger.debug("[onepilot] progress upsert failed: %s", exc)
 
 
-async def _progress_clear(config: dict[str, Any], session_id: str) -> None:
-    """Drop the live progress row. Called on `done` and on terminal errors so
-    the iOS hydrate path doesn't resurface a stale trail next time the chat
-    opens. Best-effort — a missing row is fine."""
-    import httpx
-    url = (
-        f"{config['backendUrl']}/rest/v1/agent_session_progress"
-        f"?session_id=eq.{str(session_id).lower()}"
+async def _progress_finalize(
+    config: dict[str, Any],
+    session_id: str,
+    user_id: str,
+    agent_profile_id: str,
+) -> None:
+    """Mark the live progress row finished (`is_active=false`) and clear
+    transient fields. The row stays around for a short grace window so a
+    client returning right after `done` can still see the final partial
+    state; the pg_cron sweep deletes finalised rows after 5 min. Best-
+    effort — a missing row is fine."""
+    await _progress_upsert(
+        config,
+        session_id,
+        user_id,
+        agent_profile_id,
+        partial_response="",
+        status_label="",
+        is_active=False,
     )
-    headers = {
-        "apikey": config["publishableKey"],
-        "Authorization": f"Bearer {config['publishableKey']}",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            await client.delete(url, headers=headers)
-    except Exception as exc:
-        logger.debug("[onepilot] progress clear failed: %s", exc)
 
 
 async def _post_assistant_row(config: dict[str, Any], row: dict[str, Any], text: str, kind: str = "text") -> None:
@@ -655,6 +674,16 @@ async def _stream_completion(
                 visible = "".join(visible_parts)
                 if visible:
                     accumulated.append(visible)
+                    # Forward visible content as it streams so the plugin
+                    # can persist partial assistant text into
+                    # `agent_session_progress`. iOS uses this to rebuild
+                    # the partial-response bubble after a disconnect — the
+                    # final assistant INSERT still lands via the canonical
+                    # `done` path; this is purely the in-flight snapshot.
+                    try:
+                        await on_progress("assistant_delta", {"text": visible})
+                    except Exception:
+                        pass
         except Exception:
             return
 
@@ -695,111 +724,283 @@ async def _handle_user_message(config: dict[str, Any], row: dict[str, Any]) -> N
 
     session_id = row.get("session_id")
     if not session_id:
+        # No session id = nothing to broadcast back to. The dispatch was
+        # malformed at the source (iOS always inserts with session_id), so
+        # the iOS-side stalled-state fallback handles this.
         return
 
-    try:
-        history = await _load_history(config, session_id)
-    except Exception as exc:
-        logger.warning("[onepilot] history fetch failed: %s", exc)
-        return
+    # Terminal-event contract: every dispatch that gets past the no-session
+    # gate guarantees exactly one of `done` / `error` / `cancelled` reaches
+    # iOS. The Lottie spinner clears on whichever lands first; the 2-min
+    # iOS-side hard timeout exists only as a last-resort backstop. Without
+    # this, an early return below would leave the spinner stuck for the
+    # full 2 min — the originating bug this contract closes.
+    _terminal_emitted = {"v": False}
 
-    # Skip if a foreground client (the open Onepilot app) already answered.
-    user_created = row.get("created_at") or ""
-    for h in history:
-        if (
-            h.get("role") == "assistant"
-            and isinstance(h.get("created_at"), str)
-            and isinstance(user_created, str)
-            and h["created_at"] > user_created
-        ):
+    async def _emit_terminal(event_kind: str, payload: dict[str, Any]) -> None:
+        if _terminal_emitted["v"]:
             return
-
-    messages = _normalize_history(history)
-    if not messages:
-        text = _extract_text(row.get("content"))
-        if text:
-            messages = [{"role": "user", "content": text}]
-        else:
-            return
-
-    api_port = int(os.environ.get("API_SERVER_PORT", "8642"))
-    completion_url = f"http://127.0.0.1:{api_port}/v1/chat/completions"
-    # Defense-in-depth: when the gateway is configured with API_SERVER_KEY
-    # the api_server platform rejects unauthenticated /v1/* calls. The
-    # plugin runs in-process so it sees the same env. Without this header
-    # the plugin's loopback POST would 401 after Onepilot deploy generates
-    # a key.
-    headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("API_SERVER_KEY", "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    # Tell the iOS client we accepted the message and dispatched the agent.
-    # This is the first heartbeat — it lets the UI reset its no-reply timer
-    # and surface a "thinking" state with concrete provenance ("the plugin
-    # is alive and calling the model"), separate from optimistic local UI.
-    await _broadcast(config, session_id, "started", {})
-
-    # Live trail accumulator. Every reasoning_delta / tool_progress event
-    # appends to this string and we upsert it to `agent_session_progress`
-    # so iOS can recover the trail if the user closes the app mid-thought.
-    # Plain dict-as-mutable-cell because Python closures don't see nonlocal
-    # str rebinding without the keyword and a dict avoids that ceremony.
-    _trail = {"text": ""}
-    user_id_str = str(config.get("userId") or row.get("user_id") or "")
-    agent_id_str = str(config.get("agentProfileId") or row.get("agent_profile_id") or "")
-
-    async def _on_progress(event_kind: str, payload: dict[str, Any]) -> None:
+        _terminal_emitted["v"] = True
         await _broadcast(config, session_id, event_kind, payload)
-        # Build a trail line from whatever the event carries. reasoning_delta
-        # contributes the raw text; tool_progress contributes a one-line
-        # "<emoji> <label>" marker so the trail mirrors what the iOS bubble
-        # shows. Anything else is a no-op for trail purposes.
-        line = ""
-        if event_kind == "reasoning_delta":
-            t = payload.get("text") if isinstance(payload, dict) else None
-            if isinstance(t, str):
-                line = t
-        elif event_kind == "tool_progress" and isinstance(payload, dict):
-            emoji = payload.get("emoji") or "→"
-            label = payload.get("label") or payload.get("tool") or "tool"
-            line = f"{emoji} {label}\n"
-        if not line:
-            return
-        if not _trail["text"].endswith(line):
-            _trail["text"] += line
-            if user_id_str and agent_id_str:
-                await _progress_upsert(config, session_id, user_id_str, agent_id_str, _trail["text"])
 
-    reply: Optional[str] = None
-    error: Optional[str] = None
     try:
-        # No read timeout — agent runs can take many minutes. Streaming keeps
-        # the loopback connection live so any idle timeout in the gateway
-        # never trips, and we forward progress to iOS as it arrives.
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
-        ) as client:
-            reply, error = await _stream_completion(
-                client, completion_url, headers, messages, _on_progress
+        try:
+            history = await _load_history(config, session_id)
+        except Exception as exc:
+            logger.warning("[onepilot] history fetch failed: %s", exc)
+            await _emit_terminal("error", {"message": f"history fetch failed: {exc}", "reason": "history_fetch_failed"})
+            return
+
+        # Skip if a foreground client (the open Onepilot app) already answered.
+        user_created = row.get("created_at") or ""
+        for h in history:
+            if (
+                h.get("role") == "assistant"
+                and isinstance(h.get("created_at"), str)
+                and isinstance(user_created, str)
+                and h["created_at"] > user_created
+            ):
+                # Legitimate skip — not an error. iOS treats `cancelled` as
+                # terminal and clears the spinner without surfacing a banner.
+                await _emit_terminal("cancelled", {"reason": "foreground_completed"})
+                return
+
+        # Skip if the user sent a NEWER message after the one we're about to
+        # process. The common path: user retried (or rapid-typed) while this
+        # dispatch was still in the Realtime queue. Without this guard the
+        # plugin would produce two assistant replies (the slow original + the
+        # fresh retry) and iOS would render both. Symmetric to the assistant
+        # check above.
+        for h in history:
+            if (
+                h.get("role") == "user"
+                and isinstance(h.get("created_at"), str)
+                and isinstance(user_created, str)
+                and h["created_at"] > user_created
+            ):
+                await _emit_terminal("cancelled", {"reason": "superseded_by_retry"})
+                return
+
+        messages = _normalize_history(history)
+        if not messages:
+            text = _extract_text(row.get("content"))
+            if text:
+                messages = [{"role": "user", "content": text}]
+            else:
+                await _emit_terminal("error", {"message": "user message had no extractable text", "reason": "text_missing"})
+                return
+
+        api_port = int(os.environ.get("API_SERVER_PORT", "8642"))
+        completion_url = f"http://127.0.0.1:{api_port}/v1/chat/completions"
+        # Defense-in-depth: when the gateway is configured with API_SERVER_KEY
+        # the api_server platform rejects unauthenticated /v1/* calls. The
+        # plugin runs in-process so it sees the same env. Without this header
+        # the plugin's loopback POST would 401 after Onepilot deploy generates
+        # a key.
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("API_SERVER_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        # Tell the iOS client we accepted the message and dispatched the agent.
+        # This is the first heartbeat — it lets the UI reset its no-reply timer
+        # and surface a "thinking" state with concrete provenance ("the plugin
+        # is alive and calling the model"), separate from optimistic local UI.
+        await _broadcast(config, session_id, "started", {})
+
+        # Live state accumulators. The reasoning trail, partial assistant
+        # response, and current status label are upserted into
+        # `agent_session_progress` so iOS can rebuild the full in-flight UI
+        # (Lottie, status pill, partial response, trail) when the user
+        # reopens the chat / app mid-thought. Realtime broadcasts remain the
+        # fast path; this row is the durable catch-up snapshot.
+        _trail = {"text": ""}
+        _partial = {"text": ""}
+        _status = {"text": "Thinking…"}
+        user_id_str = str(config.get("userId") or row.get("user_id") or "")
+        agent_id_str = str(config.get("agentProfileId") or row.get("agent_profile_id") or "")
+        # Initial row: is_active=true, started_at=now. Subsequent upserts
+        # bump last_activity_at and (selectively) the field that changed.
+        if user_id_str and agent_id_str:
+            await _progress_upsert(
+                config, session_id, user_id_str, agent_id_str,
+                reasoning_text="",
+                partial_response="",
+                status_label=_status["text"],
+                is_active=True,
+                set_started_at=True,
             )
+
+        # Wall-clock of the most recent progress event. Drives the thinking
+        # heartbeat below: when the model is in pure chain-of-thought (no
+        # exposed `reasoning_*` deltas, no tool calls — common for
+        # reasoning models like o1 / DeepSeek-R1 / GLM-Z routed through
+        # the api_server), nothing reaches iOS for tens of seconds and the
+        # spinner falsely flips to stalled. The heartbeat keeps
+        # `lastActivityAt` rolling on the iOS side so the UI reflects real
+        # liveness.
+        import time as _time
+        last_progress_at = {"v": _time.monotonic()}
+
+        async def _on_progress(event_kind: str, payload: dict[str, Any]) -> None:
+            last_progress_at["v"] = _time.monotonic()
+            # `assistant_delta` is an internal-to-plugin event that carries
+            # mid-stream visible text. We don't broadcast it (the canonical
+            # assistant INSERT after `done` is the wire-level shape iOS
+            # expects); we just persist it into `partial_response`.
+            if event_kind != "assistant_delta":
+                await _broadcast(config, session_id, event_kind, payload)
+
+            line = ""
+            new_status: Optional[str] = None
+            new_partial: Optional[str] = None
+            if event_kind == "reasoning_delta":
+                t = payload.get("text") if isinstance(payload, dict) else None
+                if isinstance(t, str):
+                    line = t
+            elif event_kind == "tool_progress" and isinstance(payload, dict):
+                emoji = payload.get("emoji") or "→"
+                label = payload.get("label") or payload.get("tool") or "tool"
+                line = f"{emoji} {label}\n"
+                tool = payload.get("tool")
+                if isinstance(tool, str) and tool:
+                    new_status = f"Running {tool}…"
+                elif isinstance(label, str) and label:
+                    new_status = label
+                else:
+                    new_status = "Working…"
+            elif event_kind == "assistant_delta":
+                t = payload.get("text") if isinstance(payload, dict) else None
+                if isinstance(t, str) and t:
+                    _partial["text"] += t
+                    new_partial = _partial["text"]
+
+            trail_changed = bool(line) and not _trail["text"].endswith(line)
+            if trail_changed:
+                _trail["text"] += line
+            status_changed = new_status is not None and new_status != _status["text"]
+            if status_changed:
+                _status["text"] = new_status  # type: ignore[assignment]
+
+            if not (trail_changed or status_changed or new_partial is not None):
+                return
+            if user_id_str and agent_id_str:
+                await _progress_upsert(
+                    config, session_id, user_id_str, agent_id_str,
+                    reasoning_text=_trail["text"] if trail_changed else None,
+                    partial_response=new_partial,
+                    status_label=_status["text"] if status_changed else None,
+                    is_active=True,
+                )
+
+        # Side-task: emit a "thinking" heartbeat every ~12s when no progress
+        # has flowed through `_on_progress`. Reasoning models can spend a
+        # full minute in pure CoT before producing the first visible token;
+        # without this, iOS sees only the initial `started` and flips to
+        # stalled-state copy at 25s. The heartbeat is shaped as a regular
+        # `tool_progress` so the existing iOS handler renders it as a
+        # "thinking" trail line instead of needing a new event type.
+        import asyncio as _asyncio
+
+        async def _heartbeat_loop() -> None:
+            while True:
+                await _asyncio.sleep(4)
+                # Only emit if it's actually been quiet for >12s. Real
+                # progress events bump `last_progress_at` so a chatty model
+                # never sees a heartbeat.
+                if _time.monotonic() - last_progress_at["v"] >= 12.0:
+                    try:
+                        await _on_progress("tool_progress", {
+                            "tool": "thinking",
+                            "label": "Thinking…",
+                            "emoji": "🧠",
+                            "kind": "heartbeat",
+                        })
+                    except Exception:
+                        # Heartbeat failures are non-fatal — the canonical
+                        # 2-min iOS backstop still catches truly dead runs.
+                        pass
+
+        reply: Optional[str] = None
+        error: Optional[str] = None
+        heartbeat_task = _asyncio.create_task(_heartbeat_loop())
+        try:
+            # No read timeout — agent runs can take many minutes. Streaming keeps
+            # the loopback connection live so any idle timeout in the gateway
+            # never trips, and we forward progress to iOS as it arrives.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+            ) as client:
+                reply, error = await _stream_completion(
+                    client, completion_url, headers, messages, _on_progress
+                )
+        except Exception as exc:
+            error = f"api_server call failed: {exc}"
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (BaseException,):
+                # Includes asyncio.CancelledError (which is a BaseException
+                # subclass on 3.8+); swallow so the outer try/except/finally
+                # contract still runs.
+                pass
+
+        if error:
+            logger.warning("[onepilot] %s", error)
+            # Surface the failure as a visible assistant row so the user sees
+            # WHY their request didn't produce a reply, instead of staring at a
+            # silent spinner until the iOS reply-timeout fires.
+            await _emit_terminal("error", {"message": error, "reason": "completion_failed"})
+            try:
+                await _post_assistant_row(config, row, f"⚠️ {error}")
+            except Exception as post_exc:
+                logger.warning("[onepilot] error-row post failed: %s", post_exc)
+            if user_id_str and agent_id_str:
+                await _progress_finalize(config, session_id, user_id_str, agent_id_str)
+            return
+        assert reply is not None  # narrowed by error == None
+
+        # Success path. The `done` broadcast is the last heartbeat before the
+        # canonical assistant INSERT lands. If `_post_assistant_row` raises
+        # AFTER `done`, iOS would extend its deadline on `done` and then wait
+        # for a row that never arrives — back to the stuck spinner. Wrap the
+        # row post so we can downgrade to a follow-up `error` instead.
+        await _emit_terminal("done", {})
+        try:
+            await _post_assistant_row(config, row, reply)
+        except Exception as post_exc:
+            logger.warning("[onepilot] assistant row post failed after done: %s", post_exc)
+            # `_terminal_emitted` is already True; bypass the helper and emit
+            # a follow-up error so iOS hears that the row will never land.
+            await _broadcast(config, session_id, "error", {
+                "message": f"assistant row post failed: {post_exc}",
+                "reason": "row_post_failed_post_done",
+            })
+        if user_id_str and agent_id_str:
+            await _progress_finalize(config, session_id, user_id_str, agent_id_str)
     except Exception as exc:
-        error = f"api_server call failed: {exc}"
-
-    if error:
-        logger.warning("[onepilot] %s", error)
-        # Surface the failure as a visible assistant row so the user sees
-        # WHY their request didn't produce a reply, instead of staring at a
-        # silent spinner until the iOS reply-timeout fires.
-        await _broadcast(config, session_id, "error", {"message": error})
-        await _post_assistant_row(config, row, f"⚠️ {error}")
-        await _progress_clear(config, session_id)
-        return
-    assert reply is not None  # narrowed by error == None
-
-    await _broadcast(config, session_id, "done", {})
-    await _post_assistant_row(config, row, reply)
-    await _progress_clear(config, session_id)
+        # Anything we didn't anticipate — make sure iOS hears something.
+        logger.exception("[onepilot] handler crashed: %s", exc)
+        try:
+            await _broadcast(config, session_id, "error", {
+                "message": f"plugin crash: {exc}",
+                "reason": "plugin_crash",
+            })
+        except Exception:
+            pass
+    finally:
+        # Defense in depth: if no terminal event was emitted along any code
+        # path above (e.g. a bare `return` slipped past the contract in a
+        # future edit), still tell iOS the run ended.
+        if not _terminal_emitted["v"]:
+            try:
+                await _broadcast(config, session_id, "error", {
+                    "message": "plugin returned without terminal event",
+                    "reason": "missing_terminal",
+                })
+            except Exception:
+                pass
 
 
 async def _load_history(config: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
